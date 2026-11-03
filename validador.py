@@ -137,6 +137,7 @@ def _limpiar_fecha(s: str) -> str:
     f = fold(str(s))
     f = re.sub(r"[\[\]_]", " ", f)                                   # "[2024]" (año deducido), "_03/05/2023"
     f = re.sub(r"\b2\s?\.?\s?0\s?(\d)\s?(\d)\b", r"20\1\2", f)        # "2.023", "2 024" (escáner)
+    f = re.sub(r"([A-Z])\s*[/\-]\s*(?=\d)", r"\1 ", f)                    # "JUNIO/2026", "AGOSTO-26"
     f = re.sub(r"([A-Z])(\d)", r"\1 \2", f)                             # "DE2024", "DEL2024"
     f = re.sub(r"(\d)(?=[A-Z])", r"\1 ", f)
     return re.sub(r"\s+", " ", f).strip()
@@ -157,10 +158,16 @@ def parse_fecha(s):
             if int(m[2]) > 12 and int(m[1]) <= 12:   # escrita mes/día/año ("4/26/2023")
                 return dt.date(int(m[3]), int(m[1]), int(m[2])), False
             return dt.date(int(m[3]), int(m[2]), int(m[1])), True
+        m = re.fullmatch(r"\s*(\d{1,2})\s*[/\-]\s*(\d{1,2})\s*[/\-]\s*(\d{2})\s*", f)   # "01/08/26": año de 2 cifras
+        if m:
+            return dt.date(2000 + int(m[3]), int(m[2]), int(m[1])), False
         m = re.search(r"(\d{1,2})\s+(?:D?E\s+)?([A-Z]+)\s+(?:DEL?\s+)?(\d{4})", f)
         if m and mes_num(m[2]):
             return dt.date(int(m[3]), mes_num(m[2]), int(m[1])), m[2] in MESES
-        m = re.search(r"(\d{1,2})\s+DE\s+(\d{1,2})\s+DEL?\s+(\d{4})", f)
+        m = re.search(r"(\d{1,2})\s+(?:D?E\s+)?([A-Z]+)\s+(?:DEL?\s+)?(\d{2})\s*$", f)   # "12 de agosto/25"
+        if m and mes_num(m[2]):
+            return dt.date(2000 + int(m[3]), mes_num(m[2]), int(m[1])), False
+        m = re.search(r"(\d{1,2})\s+DEL?\s+(\d{1,2})\s+DEL?\s+(\d{4})", f)
         if m:
             return dt.date(int(m[3]), int(m[2]), int(m[1])), True
         m = re.search(r"(\d{1,2})\D{0,2}(\d{2})\D{0,2}(\d{4})", f)
@@ -258,6 +265,43 @@ class Renderizador:
         raise RuntimeError("No se pudo convertir la página en imagen. " + " | ".join(errores))
 
 
+def _chars_horizontales(pg) -> list[dict] | None:
+    """Caso real (paz y salvo de JENIFFER ZAIRA ROMERO JIMENEZ, julio 2026, PDF hecho con PDF24/Ghostscript):
+    las letras traen una escala casi 1 (0.998 en vez de 1.0) y pdfplumber las marca como texto 'no
+    horizontal' (upright=False). Entonces las lee como si fueran texto vertical y separa casi cada letra
+    ("P o r m e d io d e la p r e s e n t e"): no se reconoce el formato FO-AC-101 y el certificado se
+    descarta como 'carta adjunta', aunque en pantalla se ve perfectamente normal. Si la mayoría de las
+    letras de la página son así, se devuelven con upright=True las que en realidad son horizontales
+    (matriz sin rotación); las demás se dejan como están. Si la página es normal, devuelve None."""
+    chars = pg.chars
+    if not chars or sum(1 for c in chars if not c.get("upright", True)) <= len(chars) / 2:
+        return None
+
+    def horizontal(c):
+        m = c.get("matrix") or (1, 0, 0, 1, 0, 0)
+        return m[0] > 0 and m[3] > 0 and abs(m[1]) < 0.05 and abs(m[2]) < 0.05
+
+    return [dict(c, upright=True) if not c.get("upright", True) and horizontal(c) else c for c in chars]
+
+
+def _texto_pdf(pg, **kw) -> str:
+    """extract_text de pdfplumber, corrigiendo las letras horizontales mal marcadas (ver _chars_horizontales)."""
+    from pdfplumber.utils.text import extract_text
+    chars = _chars_horizontales(pg)
+    if chars is None:
+        return pg.extract_text(**kw) or ""
+    return extract_text(chars, **kw) or ""
+
+
+def _palabras_pdf_pagina(pg, **kw) -> list[dict]:
+    """extract_words de pdfplumber con la misma corrección de letras horizontales."""
+    from pdfplumber.utils.text import extract_words
+    chars = _chars_horizontales(pg)
+    if chars is None:
+        return pg.extract_words(**kw)
+    return extract_words(chars, **kw)
+
+
 def leer_pdf(data: bytes, config: dict | None = None, ocr: bool = True, avisos: list | None = None) -> list[dict]:
     """Una entrada por página: {pagina, texto, fuente: 'texto'|'OCR'|'ILEGIBLE'}."""
     import pdfplumber
@@ -268,7 +312,7 @@ def leer_pdf(data: bytes, config: dict | None = None, ocr: bool = True, avisos: 
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         for i, p in enumerate(pdf.pages):
             try:
-                txt = p.extract_text() or ""
+                txt = _texto_pdf(p)
             except Exception:  # noqa: BLE001
                 txt = ""
             fuente = "texto"
@@ -331,8 +375,13 @@ class Doc:
     texto: str = ""
     es_formato: bool = True   # False = otro soporte adjunto (transferencia, etc.): no se revisa
     motivo_no_formato: str = ""  # por qué no se revisa (portada del formato, plantilla en blanco...)
+    archivo: str = ""
     # resultado del cruce
     excel: dict | None = None
+    forzada: dict | None = None     # fila del FO-AC-83 asignada por descarte o a mano (cédula/nombre ilegibles)
+    motivo_forzada: str = ""        # "auto: ..." o "manual"
+    auto_fila: dict | None = None   # la que propuso el emparejamiento automático (para volver a ella)
+    auto_motivo: str = ""
     hallazgos: list = field(default_factory=list)  # (nivel, campo, mensaje)
 
     def add(self, nivel, campo, msg):
@@ -352,9 +401,13 @@ def _limpia_texto(s: str) -> str:
 
 _MES = r"[A-Z]{3,10}"
 _ANIO = r"(?:2\s?\.?\s?0\s?\d\s?\d|\d{4})"   # "2024", y lo que deja el escáner: "2.024", "2 024"
+# Formatos aceptados: 16/07/2026, 16/07/26, 16 de julio de 2026, 16 de julio/2026, 16 de julio/26,
+# 16 de julio de 26, 16 de 07 de 2026, 16-07-2026 (y lo que deja el escáner)
 DATE = (r"(?:\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{4}"
-        r"|\d{1,2}\s*(?:D?E\s+)?" + _MES + r"\s*(?:DEL?\s*)?" + _ANIO +
-        r"|\d{1,2}[_\s]*DE[_\s]*\d{1,2}[_\s]*DEL?[_\s]*" + _ANIO + r"_?"
+        r"|\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2}(?!\d)"
+        r"|\d{1,2}\s*(?:D?E\s+)?" + _MES + r"\s*(?:DEL?\s*|[/\-]\s*)?" + _ANIO +
+        r"|\d{1,2}\s*(?:D?E\s+)?" + _MES + r"\s*(?:[/\-]\s*|DEL?\s+)\d{2}(?!\d)" +
+        r"|\d{1,2}[_\s]*DEL?[_\s]*\d{1,2}[_\s]*DEL?[_\s]*" + _ANIO + r"_?"
         r"|\d{1,2}\D{0,2}\d{2}\D{0,2}\d{4})")
 _DIA_MES = r"\d{1,2}\s*(?:D?E\s+)?" + _MES          # fecha sin año: "22 de febrero"
 _DESDE = r"DESDE\s+EL\s*(?:DIA\s*)?[_\s]*"
@@ -516,7 +569,7 @@ def extraer_campos(texto: str, paginas, fuentes) -> Doc:
         if mp:
             d.desde_raw = t[mp[0].start(1):mp[0].end(1)].strip()
             d.hasta_raw = t[mp[0].start(2):mp[0].end(2)].strip()
-        d.empresa = g(r"PERMITO CERTIFICAR QUE\s+(?:EL\s+|LA\s+)?(.+?)\s*,?\s+EST[AE]\s+A\s+PAZ")
+        d.empresa = g(r"PERMITO CERTIFICAR QUE\s+(?:LA\s+EMPRESA[\s_,]*|EL\s+|LA\s+)?(.+?)\s*,?\s+EST[AE]\s+A\s+PAZ")
 
     d.nombre = re.sub(r"^yo,?\s*(?=[A-ZÁÉÍÓÚÑ])", "", d.nombre)  # "yoLUIS ..." (palabras pegadas)
     d.asunto = g(r"ASUNTO:\s*(.+?)\s+RESPETADOS")
@@ -534,7 +587,7 @@ def extraer_campos(texto: str, paginas, fuentes) -> Doc:
     mc = re.search(r"CONTRATO IDU\s*(?:NO|N°|N)\.?\s*(\d{2,4})\s*-\s*(\d{4})", f)
     d.contrato = f"{mc[1]}-{mc[2]}" if mc else ""
 
-    d.fecha_doc_raw = g(r"BOGOTA[,\.]?\s*D\.?\s*[C€]\.?\s*[_\s]*(" + DATE + r")")
+    d.fecha_doc_raw = g(r"BOGOTA[,\.]?\s*(?:D\.?\s*[C€]\.?)?\s*[_\s,]*(" + DATE + r")")
     d.fecha_firma_raw = g(r"SE FIRMA\s+(?:EN\s+[A-Z\. ]+?\s+)?A LOS,?\s*"
                           r"(\d{1,2}\s+DIA[S]?(?:\(S\))?\s+DEL MES\s+(?:DE\s+)?[A-Z]+\s+(?:DEL\s+\S+\s+|DE\s+)\d{4})")
 
@@ -569,7 +622,7 @@ def palabras_pdf(data: bytes, idx: int):
     import pdfplumber
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         pg = pdf.pages[idx]
-        ws = pg.extract_words(x_tolerance=2, y_tolerance=3)
+        ws = _palabras_pdf_pagina(pg, x_tolerance=2, y_tolerance=3)
         return ([{"t": w["text"], "x0": w["x0"], "top": w["top"], "bottom": w["bottom"]} for w in ws],
                 float(pg.width), float(pg.height))
 
@@ -816,7 +869,7 @@ def texto_pagina(data: bytes, idx: int, modo: str, cfg: dict, rend: "Renderizado
     if modo == "xtol":
         import pdfplumber
         with pdfplumber.open(io.BytesIO(data)) as pdf:
-            return pdf.pages[idx].extract_text(x_tolerance=1.5) or ""
+            return _texto_pdf(pdf.pages[idx], x_tolerance=1.5)
     return _ocr(rend.render(idx, cfg["dpi_ocr"]).convert("L"), cfg)
 
 
@@ -1237,6 +1290,18 @@ def validar_documento(d: Doc, fo83: dict | None, config: dict):
         return
     todas = []
     ceds_doc = [c for c in (d.cedula, solo_digitos(d.cedula_firma_raw)) if c]
+    if d.forzada:
+        # Cédula y nombre ilegibles (letra a mano): la fila se asignó por descarte o a mano.
+        x = d.forzada
+        if d.motivo_forzada == "manual":
+            d.add(ALERTA, "cedula", f"Asignado A MANO a {x['nombre']} (C.C. {x['cedula']}, fila {x['fila_excel']} del "
+                                    f"FO-AC-83). Cédula leída en el documento: {d.cedula_raw or 'ilegible'}.")
+        else:
+            d.add(ALERTA, "cedula", f"La cédula/nombre del documento no se leyó bien (letra a mano). Se emparejó "
+                                    f"automáticamente con {x['nombre']} (C.C. {x['cedula']}, fila {x['fila_excel']}): "
+                                    f"{d.motivo_forzada.removeprefix('auto: ')}. Confirmar con 'Ver página'.")
+        _cruzar_fila(d, x, desde, hasta, cfg, 1)
+        return
     for ced in ceds_doc:
         todas = [x for x in fo83["filas"] if x["cedula"] == ced]
         if todas:
@@ -1299,9 +1364,22 @@ def validar_documento(d: Doc, fo83: dict | None, config: dict):
                                         + (" (secciones RETIRO / INGRESO-RETIRO)." if cfg["solo_retiro"] else ".") + pista)
         return
 
-    x = elegir_fila(d, filas, desde, hasta)
+    _cruzar_fila(d, elegir_fila(d, filas, desde, hasta), desde, hasta, cfg, len(filas))
+
+
+def _cruzar_fila(d: Doc, x: dict, desde, hasta, cfg: dict, candidatas: int):
+    """Compara el documento contra una fila concreta del FO-AC-83."""
+    n0 = len(d.hallazgos)
+    _cruzar_fila_(d, x, desde, hasta, cfg, candidatas)
+    if d.forzada and "OCR" in d.fuente:
+        # Certificado escrito a mano: lo que el escáner leyó mal (nombre, cargo, empresa) no basta para un ERROR.
+        d.hallazgos[n0:] = [(ALERTA, h[1], h[2] + " (escrito a mano y leído por escáner: confirmar con 'Ver página')")
+                            if h[0] == ERROR and h[1] in ("nombre", "cargo", "empresa") else h for h in d.hallazgos[n0:]]
+
+
+def _cruzar_fila_(d: Doc, x: dict, desde, hasta, cfg: dict, candidatas: int):
     d.excel = x
-    d.candidatas = len(filas)
+    d.candidatas = candidatas
 
     mejor_nombre = max([n for n in (d.nombre, d.nombre_firma) if n] or [""], key=lambda n: similitud(n, x["nombre"]))
     _cmp_nombre(d, mejor_nombre, x["nombre"], "nombre", "Nombre vs. FO-AC-83")
@@ -1388,24 +1466,187 @@ def revisar(pdfs: list[tuple[str, bytes]], fo83: dict | None, config: dict | Non
                         d.fuente = "texto+OCR"
                     falta = campos_faltantes(d)
             docs.append(d)
-    # duplicados exactos (misma cédula, cargo y periodo)
-    vistos: dict[tuple, list[Doc]] = {}
-    for d in docs:
-        if d.cedula:
-            vistos.setdefault((d.cedula, normaliza(d.cargo), d.desde_raw, d.hasta_raw), []).append(d)
     for d in docs:
         validar_documento(d, fo83, cfg)
-        rep = vistos.get((d.cedula, normaliza(d.cargo), d.desde_raw, d.hasta_raw), [])
-        if d.cedula and len(rep) > 1:
-            d.add(ALERTA, "duplicado", "Certificado repetido (misma cédula, cargo y periodo) en las páginas: "
-                  + ", ".join(o.pagina for o in rep if o is not d))
-    faltantes = []
     if fo83:
+        emparejar_por_descarte(docs, fo83, cfg)
+    marcar_duplicados(docs)
+    faltantes = calcular_faltantes(docs, fo83)
+    return {"docs": docs, "faltantes": faltantes, "avisos": avisos, "otros": otros, "fo83": fo83,
+            "control": control_retiros(docs, fo83)}
+
+
+# ---------------------------------------------------------------------------
+# Certificados escritos a mano: emparejamiento por descarte y asignación manual
+# ---------------------------------------------------------------------------
+def marcar_duplicados(docs: list[Doc]):
+    """Alerta de certificados repetidos (misma cédula, cargo y periodo)."""
+    vistos: dict[tuple, list[Doc]] = {}
+    for d in docs:
+        d.hallazgos = [h for h in d.hallazgos if h[1] != "duplicado"]
+        if d.cedula:
+            vistos.setdefault((d.cedula, normaliza(d.cargo), d.desde_raw, d.hasta_raw), []).append(d)
+    for rep in vistos.values():
+        if len(rep) > 1:
+            for d in rep:
+                d.add(ALERTA, "duplicado", "Certificado repetido (misma cédula, cargo y periodo) en las páginas: "
+                      + ", ".join(o.pagina for o in rep if o is not d))
+
+
+def calcular_faltantes(docs: list[Doc], fo83: dict | None) -> list[dict]:
+    """Filas RETIRO del FO-AC-83 que ningún certificado cubre."""
+    if not fo83:
+        return []
+    usadas = {d.excel["fila_excel"] for d in docs if d.excel}
+    con_doc = {d.cedula for d in docs} | {d.excel["cedula"] for d in docs if d.excel}
+    return [dict(x, entrego_otro=x["cedula"] in con_doc) for x in fo83["filas"]
+            if "RETIRO" in x["seccion"] and x["fila_excel"] not in usadas]
+
+
+def necesita_asignacion(d: Doc) -> bool:
+    """Certificado que no se pudo cruzar con el FO-AC-83 por cédula ni por nombre (o que ya se asignó a mano/descarte)."""
+    return bool(d.forzada) or (not d.excel and any(h[1] == "falta_excel" for h in d.hallazgos))
+
+
+def _numeros_texto(d: Doc) -> set[str]:
+    """Todas las secuencias de 6 a 11 dígitos del documento (cédula del texto, de la firma o mal separada: '11472-7992')."""
+    out = {c for c in (d.cedula, solo_digitos(d.cedula_firma_raw)) if 6 <= len(c) <= 11}
+    for m in re.finditer(r"\d[\d\.,\-\s]{4,16}\d", d.texto or ""):
+        c = solo_digitos(m[0])
+        if 6 <= len(c) <= 11 and not re.fullmatch(r"3[56]\d2020", c):   # no el número del contrato (352-2020)
+            out.add(c)
+    return out
+
+
+def _dia_mes_tolerante(raw: str):
+    """(día, mes) de una fecha escrita a mano y mal leída por el escáner ('OG de _JULIC6', '29 decept/25')."""
+    f = fold(raw or "")
+    f = re.sub(r"(?<![A-Z])[O](?=\d|\s|$)", "0", f)
+    f = f.replace("|", "1")
+    md = re.search(r"\b([0-3]?\d)\b", f)
+    mes = None
+    for w in re.findall(r"[A-Z]{3,}", f):
+        if w in ("DEL", "DIA", "DESDE", "HASTA"):
+            continue
+        w = re.sub(r"^DE(?=[A-Z]{3})", "", w)
+        mes = mes_num(w) or (_ABREV_MES.get(w[:3]) if len(w) >= 3 else None)
+        if not mes and w[:1] == "C":   # 'CEPT' (la S leída como C)
+            mes = mes_num("S" + w[1:]) or _ABREV_MES.get("S" + w[1:3])
+        if not mes:                     # 'FEE', 'AGS': basta con las dos primeras letras si no hay ambigüedad
+            pref = [n for m_, n in MESES.items() if m_.startswith(w[:2])]
+            mes = pref[0] if len(pref) == 1 else None
+        if not mes and len(w) >= 4:
+            c = difflib.get_close_matches(w, list(MESES), n=1, cutoff=0.55)
+            mes = MESES[c[0]] if c else None
+        if mes:
+            break
+    dia = int(md[1]) if md and 1 <= int(md[1]) <= 31 else None
+    return dia, mes
+
+
+def _inicio_tolerante(d: Doc):
+    f = fold(d.texto or "")
+    m = re.search(r"DESDE\s*EL\s*DIA(.{0,40}?)HASTA", f)
+    return _dia_mes_tolerante(m[1]) if m else (None, None)
+
+
+def puntaje_descarte(d: Doc, x: dict) -> tuple[float, int, str]:
+    """Qué tan probable es que el certificado d (ilegible) corresponda a la fila x del FO-AC-83.
+    Devuelve (puntaje, dígitos de cédula en común, explicación)."""
+    pistas, sc = [], 0.0
+    ds = max((digitos_comunes(c, x["cedula"]) for c in _numeros_texto(d)), default=0)
+    if ds >= 5:
+        sc += 3 * ds / max(len(x["cedula"]), 1)
+        pistas.append(f"{ds} de {len(x['cedula'])} dígitos de la cédula")
+    hits = max((coincidencias_nombre(n, x["nombre"]) for n in (d.nombre, d.nombre_firma) if n), default=0)
+    if hits:
+        sc += min(hits, 3)
+        pistas.append(f"{hits} nombre(s)/apellido(s)")
+    t_doc = [w for w in tokens_cargo(d.cargo) if len(w) >= 5]
+    t_fo = [w for w in tokens_cargo(x["cargo"]) if len(w) >= 5 and not w.startswith("CONSTRUC")]
+    if d.cargo and x["cargo"] and (similitud(d.cargo, x["cargo"]) >= 0.6 or any(
+            difflib.SequenceMatcher(None, a_, b_).ratio() >= 0.75 for a_ in t_doc for b_ in t_fo)):
+        sc += 0.5
+        pistas.append("cargo parecido")
+    emp = re.sub(r"(?i)\bempresa\b", "", d.empresa or "")
+    if emp.strip() and x["empresa"] and similitud(emp, x["empresa"]) >= 0.55:
+        sc += 0.3
+        pistas.append("empresa parecida")
+    desde, _ = parse_fecha(d.desde_raw)
+    dia, mes = (desde.day, desde.month) if desde else _inicio_tolerante(d)
+    if x["ingreso"] and mes == x["ingreso"].month:
+        sc += 0.6 + (0.6 if dia == x["ingreso"].day else 0)
+        pistas.append("fecha de ingreso" + ("" if dia == x["ingreso"].day else " (solo el mes)"))
+    return sc, ds, ", ".join(pistas)
+
+
+def candidatos_asignacion(d: Doc, docs: list[Doc], fo83: dict) -> list[dict]:
+    """Filas RETIRO del FO-AC-83 a las que se puede asignar a mano este certificado, de la más probable a la menos:
+    primero las que no tienen certificado; al final las que ya están cubiertas por otro."""
+    usadas = {o.excel["fila_excel"] for o in docs if o.excel and o is not d}
+    filas = [x for x in fo83["filas"] if "RETIRO" in x["seccion"]]
+    return sorted(filas, key=lambda x: (x["fila_excel"] in usadas, -puntaje_descarte(d, x)[0], x["nombre"]))
+
+
+def revalidar(d: Doc, fo83: dict | None, config: dict, fila: dict | None, motivo: str = ""):
+    """Vuelve a revisar el certificado, forzando (o quitando) la fila del FO-AC-83 con la que se compara."""
+    d.hallazgos, d.excel, d.candidatas = [], None, 0
+    d.forzada, d.motivo_forzada = fila, (motivo if fila else "")
+    validar_documento(d, fo83, {**CONFIG_DEFECTO, **(config or {})})
+
+
+def emparejar_por_descarte(docs: list[Doc], fo83: dict, cfg: dict):
+    """Certificados escritos a mano que no se pudieron cruzar: se emparejan con un retiro del FO-AC-83 que no tenga
+    certificado, solo si la cédula leída se parece lo suficiente (>= 5 dígitos y a lo sumo 3 distintos) y no hay
+    otro candidato igual de bueno. Lo que no se empareje queda para asignarlo a mano en la aplicación."""
+    pend = [d for d in docs if necesita_asignacion(d)]
+    for _ in range(3):  # cada emparejamiento libera la decisión de los demás
         usadas = {d.excel["fila_excel"] for d in docs if d.excel}
-        con_doc = {d.cedula for d in docs}
-        faltantes = [dict(x, entrego_otro=x["cedula"] in con_doc) for x in fo83["filas"]
-                     if "RETIRO" in x["seccion"] and x["fila_excel"] not in usadas]
-    return {"docs": docs, "faltantes": faltantes, "avisos": avisos, "otros": otros}
+        libres = [x for x in fo83["filas"] if "RETIRO" in x["seccion"] and x["fila_excel"] not in usadas]
+        hecho = False
+        for d in [d for d in pend if not d.excel]:
+            cands = []
+            for x in libres:
+                sc, ds, pistas = puntaje_descarte(d, x)
+                if ds >= max(5, len(x["cedula"]) - 3):
+                    cands.append((ds, sc, x, pistas))
+            cands.sort(key=lambda c: (-c[0], -c[1]))
+            if cands and (len(cands) == 1 or cands[0][0] - cands[1][0] >= 2):
+                ds, sc, x, pistas = cands[0]
+                revalidar(d, fo83, cfg, x, "auto: coinciden " + pistas)
+                d.auto_fila = x
+                d.auto_motivo = d.motivo_forzada
+                libres.remove(x)
+                hecho = True
+        if not hecho:
+            break
+
+
+def control_retiros(docs: list[Doc], fo83: dict | None) -> list[dict]:
+    """Una fila por cada retiro del FO-AC-83: qué certificado lo cubre y en qué estado está."""
+    if not fo83:
+        return []
+    por_fila: dict[int, list[Doc]] = {}
+    for d in docs:
+        if d.excel:
+            por_fila.setdefault(d.excel["fila_excel"], []).append(d)
+    out = []
+    for x in fo83["filas"]:
+        if "RETIRO" not in x["seccion"]:
+            continue
+        ds = por_fila.get(x["fila_excel"], [])
+        if not ds:
+            estado = "❌ SIN CERTIFICADO"
+        else:
+            peor = max((d.estado for d in ds), key=lambda e: ORDEN[e])
+            estado = {OK: "✔ Coincide", ALERTA: "⚠ Revisar", ERROR: "✖ Con errores"}[peor]
+            if any(d.forzada for d in ds):
+                estado += " (asignado a mano)" if any(d.motivo_forzada == "manual" for d in ds) else " (emparejado por descarte)"
+        out.append({"Fila FO-AC-83": x["fila_excel"], "Nombre": x["nombre"], "Cédula": x["cedula"],
+                    "Cargo": x["cargo"], "Ingreso": fmt(x["ingreso"]), "Retiro": fmt(x["retiro"]),
+                    "Empresa": x["empresa"], "Certificado": ", ".join(f"{d.formato} pág. {d.pagina}" for d in ds) or "—",
+                    "Estado": estado})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1570,6 +1811,7 @@ def exportar_excel(res: dict) -> bytes:
     from openpyxl.utils import get_column_letter
 
     docs, faltantes, otros = res["docs"], res.get("faltantes", []), res.get("otros", [])
+    res = dict(res, control=control_retiros(docs, res.get("fo83")) if res.get("fo83") else res.get("control"))
     ROJO, AMAR, VERDE, GRIS, AZUL = "FDECEA", "FFF4D6", "E6F4EA", "F3F4F6", "1F3B5C"
     T_ROJO, T_AMAR, T_VERDE = "B42318", "9A6700", "1E7B45"
     fill = lambda c: PatternFill("solid", fgColor=c)
@@ -1764,6 +2006,27 @@ def exportar_excel(res: dict) -> bytes:
             for c, v_ in enumerate((x["nombre"], x["cedula"], x["cargo"], x["tipo"], x["empresa"], fmt(x["ingreso"]),
                                     fmt(x["retiro"]), x["fila_excel"], obs), 1):
                 celda(wf, i, c, v_, negrita=(c == 1), color=ROJO if c in (1, 9) else None)
+
+    # ------------------------------------------------------------------ 3b. Control de retiros
+    ctrl = res.get("control") or []
+    if ctrl:
+        wc = wb.create_sheet("Control de retiros", 1)
+        cols_c = list(ctrl[0].keys())
+        for col, w_ in zip("ABCDEFGHI", (10, 34, 14, 30, 12, 12, 30, 24, 30)):
+            wc.column_dimensions[col].width = w_
+        titulo(wc, 1, "CONTROL DE RETIROS: ¿CADA PERSONA RETIRADA DEL FO-AC-83 TIENE SU CERTIFICADO?", len(cols_c))
+        nota(wc, 2, "Una fila por cada persona en RETIRO del FO-AC-83, con el certificado que la cubre y su resultado.",
+             len(cols_c), GRIS, alto=24)
+        for c, h in enumerate(cols_c, 1):
+            celda(wc, 4, c, h, negrita=True, color="E4E7EC", al=centro)
+        for i, fila_c in enumerate(ctrl, 5):
+            est = fila_c["Estado"]
+            fondo, txt = ((ROJO, T_ROJO) if est.startswith(("❌", "✖")) else (AMAR, T_AMAR) if est.startswith("⚠")
+                          else (VERDE, T_VERDE))
+            for c, h in enumerate(cols_c, 1):
+                celda(wc, i, c, fila_c[h], negrita=(c == len(cols_c)), color=fondo if c == len(cols_c) else None,
+                      texto=txt if c == len(cols_c) else None)
+        wc.freeze_panes = "A5"
 
     # ------------------------------------------------------------------ 4. Páginas no revisadas
     wo = wb.create_sheet("Páginas no revisadas")
